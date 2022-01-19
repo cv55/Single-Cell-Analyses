@@ -1,0 +1,605 @@
+---
+title: "Agarwal et.al analysis"
+author: "Christos Vlachos"
+date: "-/01/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Specify necessary information
+```{r}
+tissue='C'
+samples<-list()
+qc_list_samples=list()
+normalized_list_samples=list()
+counts=c(12000,5000,12000,12000,12000)
+```
+
+##Set path to files
+```{r setup}
+knitr::opts_knit$set(root.dir = '/Users/u0149445/Desktop/agarwal/processed/raw_samples')
+```
+
+
+```{r include=FALSE}
+library(Seurat)
+library(ggplot2)
+library(stringr)
+library(ggrepel)
+library(tidyverse)
+library(cowplot)
+source("scFunctions.R")
+```
+
+##Load files for tissue
+```{r,list_files,include=FALSE, warning=FALSE}
+list_samples<-function(tissue){
+  files <- list.files(pattern=tissue, full.names=TRUE, recursive=FALSE)
+  region=tissue
+  
+  for(f in files){
+  id=str_split(f, "_")[[1]][4]
+
+  if(region=="C" || region=="SN"){
+    ind= Read10X(f)
+    ind= CreateSeuratObject(ind, min.cells = 3)
+    samples[[paste0("Individual_", id)]]<- ind
+  }
+  else{
+    stop("Region should be N or C")
+}
+}
+   return(samples)
+}
+samples<-list_samples(tissue)
+```
+
+
+##Perform QC
+```{r, message=FALSE,out.width="50%"}
+counter=1
+for(i in names(samples)){
+  print(i)
+  id=str_split(i, "_")[[1]][2]
+
+  qc_ind=seurat_qc(samples[[i]],nFeature_RNA_min=500,nFeature_RNA_max=100000,percent_mito=5,percent_ribo=5,
+                   nCount_RNA_min= 100, nCount_RNA_max = counts[counter])
+
+  qc_ind@meta.data['Group']<- paste0("Individual_", id)
+  rownames(qc_ind@meta.data)<- gsub("-1","",rownames(qc_ind@meta.data))
+  rownames(qc_ind@meta.data)<-paste(id, rownames(qc_ind@meta.data), sep="_")
+  qc_ind<- RenameCells(qc_ind, new.names=rownames(qc_ind@meta.data))
+  qc_list_samples[[paste0("Individual_", id)]]<- qc_ind
+  counter=counter+1
+  }
+```
+##Perform Normalization
+
+```{r, message=FALSE,warning=FALSE,out.width="50%"}
+counter=1
+for(i in names(qc_list_samples)){
+  id=str_split(i, "_")[[1]][2]
+  norm_ind= seurat_norm(qc_list_samples[[i]], method="vst",regress.out=c("percent.mt","percent.rb"))
+  normalized_list_samples[[paste0("Individual_", id)]]<- norm_ind
+  counter=counter+1
+}
+```
+##Integrate samples with Harmony
+```{r, message=FALSE,warning=FALSE,out.width="90%"}
+integrated_samples_harmony<- integration(qc_list_samples, method='Harmony')
+print(ElbowPlot(integrated_samples_harmony))
+integrated_samples_harmony <- integrated_samples_harmony %>% 
+  RunUMAP(reduction = "harmony", dims = 1:13) %>% 
+  FindNeighbors(reduction = "harmony", dims = 1:13) %>% 
+  FindClusters(resolution = 0.5) %>% 
+  identity()
+
+p1=DimPlot(integrated_samples_harmony, reduction = "umap", pt.size = .1,group.by = "Group")
+p2=DimPlot(integrated_samples_harmony, reduction = "umap", label = TRUE, repel = TRUE)
+print(p1+p2)
+```
+
+```{r}
+cell_anno<- read.table("/Users/u0149445/Desktop/agarwal/processed/cortex_cell_annotation/cell_annotation_cortex_new.tsv")
+for(i in seq(1,nrow(integrated_samples_harmony@meta.data))){
+ 
+  type=cell_anno[which(cell_anno[,1]==rownames(integrated_samples_harmony@meta.data[i,])),2]
+  if(length(type)>0){
+  integrated_samples_harmony@meta.data[i,'cell_type']=type}
+}
+
+cell_to_remove<- rownames(integrated_samples_harmony@meta.data[is.na(integrated_samples_harmony@meta.data$cell_type),])
+integrated_samples_harmony_filtered <- integrated_samples_harmony[,!colnames(integrated_samples_harmony) %in% cell_to_remove]
+integrated_samples_harmony_filtered <- SetIdent(integrated_samples_harmony_filtered, value = "cell_type")
+DimPlot(integrated_samples_harmony_filtered, label = T , repel = T, label.size = 3) 
+
+#saveRDS(integrated_samples_seurat_filtered, file = "cortex_r05_annotated_harmony.rds")
+Harmony.markers <- FindAllMarkers(object = integrated_samples_harmony_filtered, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+
+```
+
+```{r}
+cluster_var<- 'seurat_clusters'
+clusters <- unique(integrated_samples_harmony_filtered@meta.data[[cluster_var]])
+clusters <- clusters[order(clusters)]
+all <- data.frame()
+
+for(i in 1:length(clusters)){
+  print(i)
+  if(i !=15){
+  cluster_df <- as.data.frame(integrated_samples_harmony_filtered@meta.data %>% subset(seurat_clusters == clusters[i])  %>% .$Group %>% table() /table(integrated_samples_harmony_filtered$Group))
+
+   cluster_df$Freq <- cluster_df$Freq * 1/(sum(cluster_df$Freq))
+   cluster_df$cluster<-clusters[i]  
+    all <- rbind(all, cluster_df)
+  }
+  else{
+    cluster_df2 <- as.data.frame(integrated_samples_harmony_filtered@meta.data %>% subset(seurat_clusters == clusters[i])  %>% .$Group %>% table()
+    /table(integrated_samples_harmony_filtered$Group)[2:5])
+  
+    cluster_df2$Freq <- cluster_df2$Freq * 1/(sum(cluster_df2$Freq))
+    cluster_df2$cluster<-clusters[i]  
+    all <- rbind(all, cluster_df2)
+    
+  }
+}
+
+p <- ggplot(all, aes(y=Freq, x=cluster, fill=.)) +
+  geom_bar(stat='identity') +
+  scale_y_continuous(expand = c(0,0)) +
+  ylab('normalized proportion') +
+  theme(
+    panel.grid.major=element_blank(),
+   panel.grid.minor=element_blank(),
+    axis.text.x = element_text(angle=45, hjust=1),
+    axis.title.x = element_blank(),
+    legend.title = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank()
+  )
+print(p)
+```
+
+
+```{r}
+cluster_var<- 'cell_type'
+clusters <- unique(integrated_samples_harmony_filtered@meta.data[[cluster_var]])
+clusters <- clusters[order(clusters)]
+all <- data.frame()
+
+for(i in 1:length(clusters)){
+  print(i)
+  if(i !=5){
+  cluster_df <- as.data.frame(integrated_samples_harmony_filtered@meta.data %>% subset(cell_type == clusters[i])  %>% .$Group %>% table() /table(integrated_samples_harmony_filtered$Group))
+
+
+   cluster_df$Freq <- cluster_df$Freq * 1/(sum(cluster_df$Freq))
+   cluster_df$cluster<-clusters[i]  
+    all <- rbind(all, cluster_df)
+  }
+  else{
+    cluster_df2 <- as.data.frame(integrated_samples_harmony_filtered@meta.data %>% subset(cell_type == clusters[i])  %>% .$Group %>% table()
+    /table(integrated_samples_harmony_filtered$Group)[1])
+  
+    cluster_df2$Freq <- cluster_df2$Freq * 1/(sum(cluster_df2$Freq))
+    cluster_df2$cluster<-clusters[i]  
+    all <- rbind(all, cluster_df2)
+    
+  }
+}
+
+p <- ggplot(all, aes(y=Freq, x=cluster, fill=.)) +
+  geom_bar(stat='identity') +
+  scale_y_continuous(expand = c(0,0)) +
+  ylab('normalized proportion') +
+  theme(
+    panel.grid.major=element_blank(),
+   panel.grid.minor=element_blank(),
+    axis.text.x = element_text(angle=45, hjust=1),
+    axis.title.x = element_blank(),
+    legend.title = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank()
+  )
+print(p)
+```
+
+
+```{r}
+getwd()
+comparison_of_markers<- read.table('/Users/u0149445/Desktop/agarwal/processed/rerun/table_of_common_markers_harmony_cortex')
+print('Overlap between markers found in the current work and the original paper. After the comma we see how many of the markers are among the top 20 markers found in the publication')
+print(comparison_of_markers)
+
+```
+
+
+
+```{r}
+to_keep<-function(sobject,marker_genes){
+  marker_genes<-read.table(marker_genes)
+  to_keep<- marker_genes[c(which((marker_genes[,1] %in% rownames(sobject) ))),]
+  return(to_keep)
+}
+
+
+
+
+plotUMAP_cortex<- function(sobject, genes, file_name){
+  #name=str_split(file_name, "_")[[1]][1]
+  name=file_name
+  #print(sobject)
+  #print(length(genes))
+  sobject <- AddModuleScore(object = sobject,features = list(genes), ctrl = 80, name = name)
+ # print(sobject@meta.data)
+  um<-as.data.frame(sobject@reductions$umap@cell.embeddings)
+  um[name]<-sobject@meta.data[paste(name,1,sep="")]
+  um['cluster']<-sobject@meta.data['cell_type']
+  um<-um[order(um[name]),]
+  um2<-um[um['cluster']=='Inhibitory_neurons',]
+  um3<-um[um['cluster']=='OPC',]
+  um4<-um[um['cluster']=='Astrocyte',]
+  um5<-um[um['cluster']=='ODC',]
+  um6<-um[um['cluster']=='Excitatory_neurons',]
+  um7<-um[um['cluster']=='Microglia',]
+  
+  lab_inh<-um2 %>% group_by(cluster) %>% mutate(x = mean(UMAP_1), y = max(UMAP_2)-2)
+  lab_inh2<-um2 %>% group_by(cluster) %>% mutate(x = mean(UMAP_1), y = min(UMAP_2)+3)
+  lab_opc<-um3 %>% group_by(cluster) %>% mutate(x = mean(UMAP_1)-0.2, y = mean(UMAP_2)+0.7)
+  lab_astro<-um4 %>% group_by(cluster) %>% mutate(x = mean(UMAP_1-2.8), y = mean(UMAP_2)-1.5)
+  lab_odc<-um5 %>% group_by(cluster) %>% mutate(x = mean(UMAP_1)+2.3, y = mean(UMAP_2)+0.3)
+  lab_exc<-um6 %>% group_by(cluster) %>% mutate(x = mean(UMAP_1)-2, y = mean(UMAP_2))
+  lab_mic<-um7 %>% group_by(cluster) %>% mutate(x = mean(UMAP_1-0.6), y = mean(UMAP_2)+0.5)
+  
+  
+  setEPS()
+  postscript(paste(name,"eps", sep='.'))
+  p<-ggplot(um, aes(x=UMAP_1, y=UMAP_2)) + geom_point(aes(colour = um[,3]))+ theme_bw() + 
+    scale_colour_gradient2(name=name,low = "gray61", mid='orangered1', high = "firebrick4", midpoint = (min(um[,3]) +  max(um[,3]))/2) +
+    geom_text(lab_inh,mapping=aes(x=x, y=y, label=cluster), size=2)+
+    geom_text(lab_inh2,mapping=aes(x=x, y=y, label=cluster), size=2)+
+    geom_text(lab_opc,mapping=aes(x=x, y=y, label=cluster), size=2)+
+    geom_text(lab_astro,mapping=aes(x=x, y=y, label=cluster), size=2)+
+  geom_text(lab_odc,mapping=aes(x=x, y=y, label=cluster), size=2)+
+    geom_text(lab_exc,mapping=aes(x=x, y=y, label=cluster), size=2)+
+    geom_text(lab_mic,mapping=aes(x=x, y=y, label=cluster), size=2)
+  plot(p)
+    dev.off()
+  return(um)
+}
+getwd()
+files <- list.files(path='/Users/u0149445/Desktop/agarwal/processed/cortex_markers/',pattern="*_genes_cortex", full.names=FALSE, recursive=FALSE)
+
+
+for(file in files){
+  filename=file
+  filepath=paste('../cortex_markers/',file,sep='')
+  
+  genes_to_keep<- to_keep(integrated_samples_harmony_filtered,filepath)
+  plotUMAP_cortex(integrated_samples_harmony_filtered,genes_to_keep, filename )
+}
+
+genes_of_interest<-c("ATP10A","ATP10B","ATP10D","GBA1","GBA2","UGCG","ASAH1","SPHK1","SPHK2","SMPD1","SMPD2","SMPD3","CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","SCD-1","CERK","DEGS1","SPTLC1","SPTLC2","ACER3","PSAP","SORT1", "M6PR","SCARB2","CTSB","CTSD" , "GRN","HSPA6","SNCA","GBA1","ATP13A2","ATP10B","ATP13A2","ATP13A3","ATP13A4","SAT1","SMOX","SMS","ATP13A5","SRM","ODC1","AZIN1","AZIN2","PAOX","OAZ1","OAZ2","OAZ3","SLC32A","SLC18B1")
+all_genes=list()
+input<- integrated_samples_harmony_filtered
+
+for(i in seq(1,length(genes_of_interest))){
+  if(genes_of_interest[i] %in% row.names(input) ){
+    print(genes_of_interest[i])
+    all_genes[[genes_of_interest[i]]]<- plotUMAP_cortex(input,genes_of_interest[i],genes_of_interest[i] )
+  }}
+
+
+```
+
+```{r}
+all_genes_forplot_mean=list()
+all_genes_forplot_max=list()
+counter=1
+for(gene in all_genes_SN_harmony){
+  current_gene<- names(gene)[3]
+  gene['gene']<-names(gene)[3]
+  names(gene)<- c("UMAP_1",  "UMAP_2",  "expression",  "cluster", "gene"  )
+  
+  
+   #all_genes_cortex_harmony$gene['expression']<-all_genes_cortex_harmony$gene$gene
+  all_genes_forplot_mean[[current_gene]]<- gene %>% group_by(cluster) %>% mutate(mean_expression = mean(expression))
+  all_genes_forplot_max[[current_gene]]<- gene %>% group_by(cluster) %>% mutate(max_expression = max(expression))
+
+  all_genes_forplot_mean[[current_gene]]<- all_genes_forplot_mean[[current_gene]][!duplicated(all_genes_forplot_mean[[current_gene]][,c(4,5)]),c(4,5,6) ]
+  all_genes_forplot_max[[current_gene]]<- all_genes_forplot_max[[current_gene]][!duplicated(all_genes_forplot_max[[current_gene]][,c(4,5)]),c(4,5,6) ]
+  
+  
+  setEPS()
+  postscript(paste(current_gene,"eps", sep='.'))
+  p1<-ggplot(all_genes_forplot_mean[[current_gene]], aes(x = cluster, y = gene, fill = mean_expression)) +
+    geom_tile(color = "black") +
+    scale_fill_gradient(low = "white", high = "red") +
+    coord_fixed()
+  p2<-ggplot(all_genes_forplot_max[[current_gene]], aes(x = cluster, y = gene, fill = max_expression)) +
+    geom_tile(color = "black") +
+    scale_fill_gradient(low = "white", high = "red") +
+    coord_fixed()
+  p<-plot_grid(p1, p2, nrow=2)
+  plot(p)
+  dev.off()
+}
+
+```
+
+
+#per gene analysis to find markers using Seurat
+```{r}
+input<- integrated_samples_harmony_filtered
+genes_of_interest<-c("ATP10A","ATP10B","ATP10D","GBA1","GBA2","UGCG","ASAH1","SPHK1","SPHK2","SMPD1","SMPD2","SMPD3","CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","SCD-1","CERK","DEGS1","SPTLC1","SPTLC2","ACER3","PSAP","SORT1", "M6PR","SCARB2","CTSB","CTSD" , "GRN","HSPA6","SNCA","GBA1","ATP13A2","ATP13A2","ATP13A3","ATP13A4","SAT1","SMOX","SMS","ATP13A5","SRM","ODC1","AZIN1","AZIN2","PAOX","OAZ1","OAZ2","OAZ3","SLC32A","SLC18B1")
+
+cells<- unique(integrated_samples_harmony_filtered@meta.data[[cluster_var]])
+'%!in%' <- function(x,y)!('%in%'(x,y))
+exprs<-list()
+rest_exprs<-list()
+final<- data.frame()
+
+
+for(i in 1:length(genes_of_interest)){
+  if(genes_of_interest[i] %in% rownames(input) ){
+    for(j in 1:length(cells)){
+  
+      exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]]<- input[rownames(input)==genes_of_interest[i]]
+       x<- FindMarkers(exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]], ident.1 = cells[j],min.pct=-Inf, min.diff.pct=-Inf,only.pos=FALSE,logfc.threshold=-Inf )
+       x2<- FindMarkers(exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]], ident.1 = cells[j],min.pct=-Inf, min.diff.pct=-Inf,only.pos=FALSE,logfc.threshold=-Inf, test.use = "roc" )
+      output<- data.frame(gene=genes_of_interest[i], cell=cells[j], log2FC=x$avg_log2FC)
+      output2<- data.frame(gene=genes_of_interest[i], cell=cells[j], AUC=x2$myAUC,Power=x2$power)
+      
+      final_wilc<-rbind(final_wilc, output)
+      final_roc<- rbind(final_roc, output2)
+      }
+        }
+}
+print(final)
+
+
+
+final[order(final$log2FC, decreasing = T),]
+
+```
+
+
+
+
+
+
+##Roc analysis on subset matrix of genes of interest
+
+```{r}
+genes_of_interest<-c("ATP10A","ATP10B","ATP10D","GBA1","GBA2","UGCG","ASAH1","SPHK1","SPHK2","SMPD1","SMPD2","SMPD3","CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","SCD-1","CERK","DEGS1","SPTLC1","SPTLC2","ACER3","PSAP","SORT1", "M6PR","SCARB2","CTSB","CTSD" , "GRN","HSPA6","SNCA","GBA1","ATP13A2","ATP10B","ATP13A2","ATP13A3","ATP13A4","SAT1","SMOX","SMS","ATP13A5","SRM","ODC1","AZIN1","AZIN2","PAOX","OAZ1","OAZ2","OAZ3","SLC32A","SLC18B1")
+subset_matrix<-integrated_samples_harmony_filtered[which(rownames(integrated_samples_harmony_filtered) %in% genes_of_interest),]
+
+
+astrocyte_genes<- FindMarkers(subset_matrix,ident.1 = 'Astrocyte', only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "roc" )
+microglia_genes<- FindMarkers(subset_matrix,ident.1 = 'Microglia', only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "roc" )
+Inhib_genes<- FindMarkers(subset_matrix,ident.1 = 'Inhibitory_neurons', only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "roc" )
+Excit_genes<- FindMarkers(subset_matrix,ident.1 = 'Excitatory_neurons', only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "roc" )
+OPC_genes<- FindMarkers(subset_matrix,ident.1 = 'OPC', only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "roc" )
+ODC_genes<- FindMarkers(subset_matrix,ident.1 = 'ODC', only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use = "roc" )
+
+astrocyte_genes
+
+```
+
+
+##Gene set analysis(Maybe?)
+```{r}
+library(AUCell)
+library(GSEABase)
+
+
+ceramide_pathway_genes=c("ATP10A","ATP10B","ATP10D","GBA1","GBA2","UGCG","ASAH1","SPHK1","SPHK2","SMPD1","SMPD2","SMPD3","CERS1","CERS2","CERS3","CERS4","CERS5","CERS6","SCD-1","CERK","DEGS1","SPTLC1","SPTLC2","ACER3")
+
+lysosomal_pathway_genes=c("PSAP","SORT1", "M6PR","SCARB2","CTSB","CTSD" , "GRN","HSPA6","SNCA","GBA1","ATP13A2","ATP10B")
+
+pa_pathway_genes=c("ATP13A2","ATP13A3","ATP13A4","SAT1","SMOX","SMS","ATP13A5","SRM","ODC1","AZIN1","AZIN2","PAOX","OAZ1","OAZ2","OAZ3","SLC32A","SLC18B1")
+
+
+
+
+
+
+geneSets_ceramide <- GeneSet(ceramide_pathway_genes, setName="Ceramide")
+geneSets_lysosomal<- GeneSet(lysosomal_pathway_genes, setName="Lysosomal")
+geneSets_PA<- GeneSet(pa_pathway_genes, setName="PA")
+
+geneSets <- GeneSetCollection(c(geneSets_ceramide,geneSets_lysosomal,geneSets_PA))
+geneSets <- subsetGeneSets(geneSets, rownames(integrated_samples_harmony_filtered@assays$RNA@counts)) 
+
+nGenes(geneSets)
+
+cells_rankings <- AUCell_buildRankings(integrated_samples_harmony_filtered@assays$RNA@counts, nCores=1, plotStats=FALSE)
+
+cells_rankings
+
+cells_AUC <- AUCell_calcAUC(geneSets, cells_rankings)
+cells_assignment <- AUCell_exploreThresholds(cells_AUC, plotHist=TRUE, assign=TRUE) 
+selectedThresholds <- getThresholdSelected(cells_assignment)
+selectedThresholds
+
+plot(integrated_samples_harmony_filtered@reductions$umap@cell.embeddings, pch=16, cex=.3)
+
+selectedThresholds <- getThresholdSelected(cells_assignment)
+
+selectedThresholds<-0.1
+names(selectedThresholds)<- "Ceramide"
+for(geneSetName in names(selectedThresholds))
+{
+  nBreaks <- 5 # Number of levels in the color palettes
+  # Color palette for the cells that do not pass the threshold
+  colorPal_Neg <- grDevices::colorRampPalette(c("black","blue", "skyblue"))(nBreaks)
+  # Color palette for the cells that pass the threshold
+  colorPal_Pos <- grDevices::colorRampPalette(c("pink", "magenta", "red"))(nBreaks)
+  
+  # Split cells according to their AUC value for the gene set
+  passThreshold <- getAUC(cells_AUC)[geneSetName,] >  selectedThresholds[geneSetName]
+  if(sum(passThreshold) >0 )
+  {
+    aucSplit <- split(getAUC(cells_AUC)[geneSetName,], passThreshold)
+    
+    # Assign cell color
+    cellColor <- c(setNames(colorPal_Neg[cut(aucSplit[[1]], breaks=nBreaks)], names(aucSplit[[1]])), 
+    setNames(colorPal_Pos[cut(aucSplit[[2]], breaks=nBreaks)], names(aucSplit[[2]])))
+    
+    # Plot
+    plot(integrated_samples_harmony_filtered@reductions$umap@cell.embeddings, main=geneSetName,
+    sub="Pink/red cells pass the threshold",
+    col=cellColor[rownames(integrated_samples_harmony_filtered@reductions$umap@cell.embeddings)], pch=16) 
+  }
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- #per gene analysis using random sampling and wilcoxon -->
+<!-- ```{r} -->
+<!-- input<- integrated_samples_harmony_filtered -->
+<!-- genes_of_interest<-c("ATP10A") -->
+<!-- cells<- unique(integrated_samples_harmony_filtered@meta.data[[cluster_var]]) -->
+<!-- exprs<-list() -->
+<!-- rest_exprs<-list() -->
+<!-- '%!in%' <- function(x,y)!('%in%'(x,y)) -->
+<!-- final<- data.frame() -->
+
+<!-- for(i in 1:length(genes_of_interest)){ -->
+
+<!--   for(j in 1:length(cells)){ -->
+
+
+<!--     exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]]<- input[rownames(input)==genes_of_interest[i],colnames(input) %in%   rownames(input@meta.data[input@meta.data$cell_type==cells[j],])]@assays$RNA@counts -->
+
+<!--     rest_exprs[[paste(genes_of_interest[1],'non',cells[j],sep='_') ]]<-input[rownames(input)==genes_of_interest[i],colnames(input) %!in% rownames(input@meta.data[input@meta.data$cell_type==cells[j],])]@assays$RNA@counts -->
+
+<!--     if(ncol(exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]])<  ncol(rest_exprs[[paste(genes_of_interest[1],'non',cells[j],sep='_') ]]) ){ -->
+<!--     tosubsample<- rest_exprs[[paste(genes_of_interest[i],'non',cells[j],sep='_') ]] -->
+<!--     subsample<- tosubsample[, sample(1:ncol(tosubsample), size= ncol(exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]]) )] -->
+<!-- } -->
+
+<!--     else if(ncol(exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]]) >  ncol(rest_exprs[[paste(genes_of_interest[1],'non',cells[j],sep='_') ]]) ){ -->
+<!--       print('yes') -->
+<!--     tosubsample<- rest_exprs[[paste(genes_of_interest[i],'non',cells[j],sep='_') ]] -->
+<!--     subsample<- tosubsample [, sample(1:ncol(tosubsample), size= ncol(rest_exprs[[paste(genes_of_interest[1],'non',cells[j],sep='_') ]]) )] -->
+<!-- } -->
+
+
+
+<!--     df<- data.frame('gene'=genes_of_interest[i], counts=exprs[[paste(genes_of_interest[i],cells[j],sep='_') ]][,]) -->
+<!--     df2<- data.frame('gene'=genes_of_interest[i], counts=subsample) -->
+
+<!--     x=wilcox.test(df$counts, df2$counts) -->
+
+<!--     output<- data.frame(gene=genes_of_interest[i],celltotest=cells[j], pval=p.adjust(x$p.value)) -->
+<!--     final<- rbind(final,output) -->
+
+<!--   }} -->
+
+<!-- print(final) -->
+<!-- ``` -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- --- -->
+<!-- ##Integrate samples with Seurat -->
+<!-- #```{r, message=FALSE,warning=FALSE,out.width="90%"} -->
+<!-- integrated_samples_seurat<- integration(normalized_list_samples, method='Seurat') -->
+<!-- integrated_samples_seurat<-makeUMAP_CCA(integrated_samples_seurat) -->
+<!-- ``` -->
+
+<!-- #```{r} -->
+<!-- cell_anno<- read.table("/Users/u0149445/Desktop/agarwal/processed/cortex_cell_annotation/cell_annotation_cortex_new.tsv") -->
+<!-- for(i in seq(1,nrow(integrated_samples_seurat@meta.data))){ -->
+
+<!--   type=cell_anno[which(cell_anno[,1]==rownames(integrated_samples_seurat@meta.data[i,])),2] -->
+<!--   if(length(type)>0){ -->
+<!--   integrated_samples_seurat@meta.data[i,'cell_type']=type} -->
+<!-- } -->
+
+<!-- cell_to_remove_cortex<- rownames(integrated_samples_seurat@meta.data[is.na(integrated_samples_seurat@meta.data$cell_type),]) -->
+<!-- integrated_samples_seurat_filtered <- integrated_samples_seurat[,!colnames(integrated_samples_seurat) %in% cell_to_remove_cortex] -->
+<!-- integrated_samples_seurat_filtered <- SetIdent(integrated_samples_seurat_filtered, value = "cell_type") -->
+<!-- DimPlot(integrated_samples_seurat_filtered, label = T , repel = T, label.size = 3)  -->
+
+<!-- #saveRDS(integrated_samples_seurat_filtered, file = "cortex_r05_annotated_harmony.rds") -->
+
+
+
+<!-- ``` -->
+<!-- --- -->
+
+
+
+
+
+
+
+
+
+
+
+<!-- #```{r} -->
+<!-- cluster_var <- 'seurat_clusters' -->
+<!-- clusters <- unique(integrated_samples_seurat_filtered@meta.data[[cluster_var]]) -->
+<!-- clusters <- clusters[order(clusters)] -->
+<!-- all <- data.frame() -->
+
+<!-- for(i in seq(0,length(clusters)-1)){ -->
+<!--   print(i) -->
+<!--  # if(i !=13){ -->
+<!--   cluster_df <- as.data.frame(integrated_samples_seurat_filtered@meta.data %>% subset(seurat_clusters == clusters[i+1])  %>% .$Group %>% table()) #/table(integrated_samples_seurat_filtered$Group)) -->
+
+<!--   print(cluster_df) -->
+<!-- } -->
+
+<!-- ``` -->
